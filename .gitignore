@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large/generated artifacts
+data/
+logs/
+work/
+backup_v1_*/
+
+# Runtime flags / local state
+STOP_FOREVER.flag
+*.pid
+*.tmp
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
