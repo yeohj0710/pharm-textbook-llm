@@ -15,6 +15,7 @@ import json
 import re
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,10 +27,18 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
+    TrainerCallback,
     Trainer,
     TrainingArguments,
 )
 from transformers.trainer_utils import get_last_checkpoint
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*expandable_segments not supported on this platform.*",
+    category=UserWarning,
+)
 
 
 def read_jsonl_texts(path: Path, min_chars: int) -> List[str]:
@@ -67,6 +76,73 @@ def can_use_cuda() -> bool:
 def find_latest_checkpoint(output_dir: Path) -> Optional[str]:
     ck = get_last_checkpoint(str(output_dir))
     return ck
+
+
+class BestCheckpointByTrainLossCallback(TrainerCallback):
+    """Save best adapter snapshot based on lowest observed train loss."""
+
+    def __init__(self, output_dir: Path, tokenizer: AutoTokenizer):
+        self.output_dir = output_dir
+        self.tokenizer = tokenizer
+        self.best_dir = output_dir / "best_adapter"
+        self.meta_path = output_dir / "best_train_loss.json"
+        self.best_loss = float("inf")
+        self.best_step = -1
+        if self.meta_path.exists():
+            try:
+                meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+                self.best_loss = float(meta.get("best_train_loss", self.best_loss))
+                self.best_step = int(meta.get("best_step", self.best_step))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _latest_logged_train_loss(state: Any) -> Optional[float]:
+        for item in reversed(getattr(state, "log_history", [])):
+            if "loss" in item:
+                try:
+                    return float(item["loss"])
+                except Exception:
+                    return None
+        return None
+
+    def _save_best(self, model: Any, loss: float, step: int) -> None:
+        self.best_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(self.best_dir))
+        self.tokenizer.save_pretrained(str(self.best_dir))
+        meta = {
+            "best_train_loss": float(loss),
+            "best_step": int(step),
+            "updated_unix": int(time.time()),
+        }
+        self.meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        model = kwargs.get("model")
+        if model is None:
+            return control
+        loss = self._latest_logged_train_loss(state)
+        if loss is None:
+            return control
+        if loss < self.best_loss:
+            self.best_loss = loss
+            self.best_step = int(getattr(state, "global_step", -1))
+            self._save_best(model=model, loss=loss, step=self.best_step)
+            print(
+                json.dumps(
+                    {
+                        "event": "best_adapter_updated",
+                        "best_train_loss": self.best_loss,
+                        "best_step": self.best_step,
+                        "best_dir": str(self.best_dir),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return control
 
 
 def main() -> int:
@@ -224,6 +300,7 @@ def main() -> int:
         args=train_args,
         train_dataset=packed,
         data_collator=collator,
+        callbacks=[BestCheckpointByTrainLossCallback(output_dir=output_dir, tokenizer=tokenizer)],
     )
 
     resume_ckpt = None
@@ -239,16 +316,27 @@ def main() -> int:
     trainer.model.save_pretrained(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
 
+    best_meta_path = output_dir / "best_train_loss.json"
+    best_meta: Dict[str, Any] = {}
+    if best_meta_path.exists():
+        try:
+            best_meta = json.loads(best_meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            best_meta = {}
+
     summary = {
         "model_name": args.model_name,
         "chunks_path": str(chunks_path),
         "output_dir": str(output_dir),
         "final_adapter_dir": str(final_dir),
+        "best_adapter_dir": str(output_dir / "best_adapter"),
         "device_name": torch.cuda.get_device_name(0),
         "train_samples": len(packed),
         "max_steps": int(args.max_steps),
         "elapsed_sec": round(t1 - t0, 2),
         "resume_from_checkpoint": resume_ckpt or "",
+        "best_train_loss": best_meta.get("best_train_loss"),
+        "best_step": best_meta.get("best_step"),
     }
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
